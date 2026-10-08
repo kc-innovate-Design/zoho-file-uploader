@@ -353,8 +353,9 @@ def process_files(deal_id, files):
 
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
+            where = urlparse(e.response.url).netloc if e.response is not None else 'unknown'
             results.append({'ok': False, 'file_type': file_type,
-                            'error': f'HTTP {status}', 'file_url': file_url[:100]})
+                            'error': f'HTTP {status} from {where}', 'file_url': file_url[:100]})
         except Exception as e:
             logger.exception(f'Upload failed for {file_type}')
             results.append({'ok': False, 'file_type': file_type, 'error': str(e)})
