@@ -61,6 +61,10 @@ DRIVE_API    = 'https://www.googleapis.com/drive/v3'
 DRIVE_UPLOAD = 'https://www.googleapis.com/upload/drive/v3'
 
 DOWNLOAD_TIMEOUT = 30
+
+# Holding folder for NDAs saved at signing (Zoho CRM shared drive > NDAs)
+NDA_FOLDER_ID      = os.environ.get('NDA_FOLDER_ID', '1WBwevmKQDnOAdpDnRGRlB3ipFFrAKKiI')
+NDA_FETCH_ATTEMPTS = int(os.environ.get('NDA_FETCH_ATTEMPTS', '3'))
 MAX_FILE_SIZE    = 20 * 1024 * 1024  # 20 MB
 
 TYPE_LABELS = {
@@ -286,6 +290,30 @@ def upload_to_drive(folder_id, file_bytes, filename, content_type):
     return resp.json()
 
 
+def copy_into_folder(file_id, folder_id, name=None):
+    """Copy an existing Drive file (e.g. an NDA saved at signing) into a
+    folder. The original stays in place. Skips if a file with the same
+    name is already there, so retries don't make duplicates."""
+    meta = requests.get(f'{DRIVE_API}/files/{file_id}',
+                        params={'supportsAllDrives': 'true', 'fields': 'id,name,size,trashed'},
+                        headers=drive_headers(), timeout=15)
+    meta.raise_for_status()
+    m = meta.json()
+    if m.get('trashed'):
+        raise ValueError(f'Saved file {file_id} is in the bin')
+    target_name = name or m['name']
+    for f in find_in_folder(folder_id, target_name):
+        logger.info(f'Duplicate skipped: {target_name}')
+        return {'id': f['id'], 'webViewLink': f.get('webViewLink'), 'duplicate': True,
+                'name': target_name, 'size': f.get('size')}
+    resp = requests.post(f'{DRIVE_API}/files/{file_id}/copy',
+                         params={'supportsAllDrives': 'true', 'fields': 'id,webViewLink,name,size'},
+                         json={'name': target_name, 'parents': [folder_id]},
+                         headers=drive_headers(), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
 # ---------------------------------------------------------------------------
 # Legacy Zoho path (STORAGE_TARGET=zoho)
 # ---------------------------------------------------------------------------
@@ -307,7 +335,8 @@ def process_files(deal_id, files):
     results = []
     folder_id, folder_how = None, None
 
-    valid = [f for f in files if str(f.get('url', '')).strip().startswith('http')]
+    valid = [f for f in files if str(f.get('url', '')).strip().startswith('http')
+             or str(f.get('drive_file_id', '')).strip()]
 
     if STORAGE_TARGET == 'drive' and valid:
         try:
@@ -322,6 +351,28 @@ def process_files(deal_id, files):
         file_url  = str(f.get('url', '')).strip()
         file_type = str(f.get('type', 'unknown')).strip()
         custom_fn = str(f.get('filename', '')).strip()
+        saved_id  = str(f.get('drive_file_id', '')).strip()
+
+        # A file already in Drive (an NDA saved at signing): copy it in, no download.
+        if saved_id and STORAGE_TARGET == 'drive':
+            try:
+                label = TYPE_LABELS.get(file_type, file_type.title())
+                d = copy_into_folder(saved_id, folder_id,
+                                     f'{label} - {custom_fn}' if custom_fn else None)
+                results.append({
+                    'ok': True, 'file_type': file_type, 'filename': d.get('name'),
+                    'size_bytes': int(d.get('size') or 0), 'drive_file_id': d.get('id'),
+                    'drive_link': d.get('webViewLink'), 'duplicate': d.get('duplicate', False),
+                    'source': 'saved',
+                })
+                continue
+            except Exception as e:
+                logger.exception(f'Copy of saved {file_type} {saved_id} failed')
+                if not file_url.startswith('http'):
+                    results.append({'ok': False, 'file_type': file_type,
+                                    'error': f'Could not copy saved file: {e}'})
+                    continue
+                # otherwise fall through and try the link instead
 
         if not file_url.startswith('http'):
             results.append({'ok': False, 'file_type': file_type,
@@ -361,12 +412,18 @@ def process_files(deal_id, files):
             results.append({'ok': False, 'file_type': file_type, 'error': str(e)})
 
     uploaded = [r['file_type'] for r in results if r.get('ok')]
-    if uploaded:
+    failed   = [r['file_type'] for r in results if not r.get('ok') and not r.get('skipped')]
+    for r in results:
+        if not r.get('ok') and not r.get('skipped'):
+            logger.error(f'NOT FILED for deal {deal_id}: {r.get("file_type")} - {r.get("error")}')
+    if uploaded or (failed and STORAGE_TARGET == 'drive'):
         ts = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
         if STORAGE_TARGET == 'drive':
             # Audit trail only — no workflow, so the WorkDrive Deluge doesn't run
-            update_deal(deal_id, {'Latest_Action_Sync':
-                        f'Drive — {", ".join(uploaded)} filed — {ts}'})
+            msg = f'Drive — {", ".join(uploaded) or "nothing"} filed'
+            if failed:
+                msg += f' — MISSING: {", ".join(failed)}'
+            update_deal(deal_id, {'Latest_Action_Sync': f'{msg} — {ts}'})
         else:
             update_deal(deal_id, {'Latest_Action_Sync':
                         f'File Uploader — {", ".join(uploaded)} — {ts}'},
@@ -417,6 +474,53 @@ def upload_batch():
         return jsonify({'ok': False, 'error': 'Missing or invalid deal_id'}), 400
 
     return jsonify(process_files(deal_id, body.get('files', []))), 200
+
+
+@app.route('/save-nda', methods=['POST'])
+def save_nda():
+    """Called by the NDA automation the moment someone signs, while the
+    website's PDF link still works. Saves the PDF into the NDAs folder and
+    returns its Drive ID so the idea automation can file it later."""
+    if not check_auth():
+        return jsonify({'ok': False, 'error': 'Unauthorized'}), 401
+    body = request.get_json(silent=True) or {}
+    url = str(body.get('nda_url', '')).strip()
+    if not url.startswith('http'):
+        return jsonify({'ok': False, 'error': 'Missing or invalid nda_url'}), 400
+    if not NDA_FOLDER_ID:
+        return jsonify({'ok': False, 'error': 'NDA_FOLDER_ID not set'}), 500
+
+    first = str(body.get('first_name', '')).strip()
+    last  = str(body.get('last_name', '')).strip()
+    email = str(body.get('email', '')).strip()
+
+    last_err = None
+    for attempt in range(1, NDA_FETCH_ATTEMPTS + 1):
+        try:
+            file_bytes, content_type, filename = download_file(url)
+            break
+        except Exception as e:
+            last_err = e
+            logger.warning(f'NDA download attempt {attempt} failed: {e}')
+            if attempt < NDA_FETCH_ATTEMPTS:
+                time.sleep(4)
+    else:
+        logger.error(f'NDA NOT SAVED for {email}: {last_err}')
+        return jsonify({'ok': False, 'error': f'Download failed: {last_err}'}), 200
+
+    who = ' '.join(x for x in (first, last) if x) or 'Unknown'
+    stamp = datetime.now().strftime('%Y-%m-%d %H%M')
+    drive_name = (f'NDA - {who} - {email} - {stamp}.pdf' if email
+                  else f'NDA - {who} - {stamp} - {filename}').replace('/', '-')
+    try:
+        d = upload_to_drive(NDA_FOLDER_ID, file_bytes, drive_name, content_type)
+    except Exception as e:
+        logger.exception('NDA save to Drive failed')
+        return jsonify({'ok': False, 'error': f'Drive upload failed: {e}'}), 200
+
+    logger.info(f'NDA saved for {email}: {d.get("id")} ({len(file_bytes)} bytes)')
+    return jsonify({'ok': True, 'drive_file_id': d.get('id'), 'drive_link': d.get('webViewLink'),
+                    'filename': drive_name, 'size_bytes': len(file_bytes)}), 200
 
 
 @app.route('/health', methods=['GET'])
