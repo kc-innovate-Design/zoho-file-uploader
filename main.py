@@ -40,6 +40,9 @@ logger = logging.getLogger('file-uploader')
 # ---------------------------------------------------------------------------
 
 SERVICE_SECRET = os.environ.get('SERVICE_SECRET', '')
+# Only set while rotating: the old secret, still accepted so callers can be
+# switched over one at a time. Remove once the logs show nobody uses it.
+SERVICE_SECRET_PREVIOUS = os.environ.get('SERVICE_SECRET_PREVIOUS', '')
 ALLOW_OPEN     = os.environ.get('ALLOW_OPEN', '').lower() == 'true'  # dev only
 
 ZOHO_CLIENT_ID     = os.environ.get('ZOHO_CLIENT_ID', '')
@@ -97,7 +100,12 @@ def check_auth():
     if not token:
         body = request.get_json(silent=True) or {}
         token = str(body.get('service_secret', ''))
-    return hmac.compare_digest(token, SERVICE_SECRET)
+    if hmac.compare_digest(token, SERVICE_SECRET):
+        return True
+    if SERVICE_SECRET_PREVIOUS and hmac.compare_digest(token, SERVICE_SECRET_PREVIOUS):
+        logger.warning(f'OLD SECRET used on {request.path}: switch this caller to the new secret')
+        return True
+    return False
 
 
 def get_zoho_token():
