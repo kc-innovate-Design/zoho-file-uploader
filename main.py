@@ -11,7 +11,10 @@ STORAGE_TARGET=zoho             -> old behaviour: Zoho attachment + WorkDrive
 
 Endpoints:
   POST /upload         — Upload a single file for a Deal
-  POST /upload-batch   — Upload multiple files for a Deal in one call
+  POST /upload-batch   — Upload multiple files for a Deal in one call. If no
+                         saved NDA is sent, looks in the NDAs folder by the
+                         deal's contact email (then name) before giving up
+  POST /save-nda       — Save an NDA PDF into the NDAs folder at signing
   GET  /health         — Health check
 """
 
@@ -20,7 +23,7 @@ import io
 import time
 import hmac
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote
 
 import requests
@@ -65,6 +68,11 @@ DOWNLOAD_TIMEOUT = 30
 # Holding folder for NDAs saved at signing (Zoho CRM shared drive > NDAs)
 NDA_FOLDER_ID      = os.environ.get('NDA_FOLDER_ID', '1WBwevmKQDnOAdpDnRGRlB3ipFFrAKKiI')
 NDA_FETCH_ATTEMPTS = int(os.environ.get('NDA_FETCH_ATTEMPTS', '3'))
+# /upload-batch: how long to keep looking in the NDAs folder when the
+# integration didn't send a saved NDA (the NDA may still be saving)
+NDA_WAIT_SECONDS   = int(os.environ.get('NDA_WAIT_SECONDS', '45'))
+NDA_POLL_INTERVAL  = 10
+NDA_LOOKBACK_DAYS  = int(os.environ.get('NDA_LOOKBACK_DAYS', '120'))
 MAX_FILE_SIZE    = 20 * 1024 * 1024  # 20 MB
 
 TYPE_LABELS = {
@@ -314,6 +322,103 @@ def copy_into_folder(file_id, folder_id, name=None):
     return resp.json()
 
 
+def _norm(text):
+    return ' '.join(str(text or '').lower().split())
+
+
+def list_saved_ndas():
+    """NDAs saved at signing in the last NDA_LOOKBACK_DAYS, newest first."""
+    since = (datetime.now(timezone.utc) - timedelta(days=NDA_LOOKBACK_DAYS)
+             ).strftime('%Y-%m-%dT%H:%M:%SZ')
+    files, token = [], None
+    while True:
+        params = {
+            'q': f"'{NDA_FOLDER_ID}' in parents and trashed = false and createdTime > '{since}'",
+            'supportsAllDrives': 'true',
+            'includeItemsFromAllDrives': 'true',
+            'orderBy': 'createdTime desc',
+            'pageSize': 1000,
+            'fields': 'nextPageToken,files(id,name,createdTime)',
+        }
+        if token:
+            params['pageToken'] = token
+        resp = requests.get(f'{DRIVE_API}/files', params=params,
+                            headers=drive_headers(), timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        files += data.get('files', [])
+        token = data.get('nextPageToken')
+        if not token:
+            return files
+
+
+def match_saved_nda(ndas, email, full_name):
+    """Saved NDAs are named 'NDA - First Last - email - YYYY-MM-DD HHMM.pdf'.
+    Returns (file, how). Email match wins. A name match is only used when
+    every NDA with that name was signed from the same email address, so two
+    different people with the same name are never confused. Newest wins."""
+    email, full_name = _norm(email), _norm(full_name)
+    if email:
+        for f in ndas:
+            if f' - {email} - ' in _norm(f.get('name')):
+                return f, 'email'
+    if full_name:
+        prefix = f'nda - {full_name} - '
+        hits = [f for f in ndas if _norm(f.get('name')).startswith(prefix)]
+        emails = {_norm(f['name'])[len(prefix):].split(' - ')[0] for f in hits}
+        if hits and len(emails) == 1:
+            return hits[0], 'name'
+    return None, None
+
+
+def find_saved_nda(email, full_name):
+    """Look for the client's saved NDA, waiting briefly in case it's still
+    being saved (the NDA and idea automations can run at the same moment)."""
+    deadline = time.time() + NDA_WAIT_SECONDS
+    while True:
+        ndas = list_saved_ndas()
+        f, how = match_saved_nda(ndas, email, '')
+        if f:
+            return f, how
+        if time.time() >= deadline:
+            return match_saved_nda(ndas, '', full_name)
+        time.sleep(NDA_POLL_INTERVAL)
+
+
+def attach_saved_nda(deal_id, files):
+    """If the integration didn't send a saved NDA, find one in the NDAs
+    folder and add it to the batch. Returns a note for Latest_Action_Sync
+    when the NDA was matched by name (worth a human check)."""
+    has_saved = any(str(f.get('type', '')).strip() == 'nda'
+                    and str(f.get('drive_file_id', '')).strip() for f in files)
+    if has_saved or STORAGE_TARGET != 'drive' or not NDA_FOLDER_ID:
+        return None
+    try:
+        deal = get_deal(deal_id)
+        email = deal.get('Contact_Email') or ''
+        name = (deal.get('Contact_Name') or {}).get('name', '')
+        found, how = find_saved_nda(email, name)
+    except Exception:
+        logger.exception(f'Saved NDA lookup failed for deal {deal_id}')
+        return None
+
+    entry = next((f for f in files if str(f.get('type', '')).strip() == 'nda'), None)
+    if not found:
+        logger.warning(f'No saved NDA found for deal {deal_id} ({email or name})')
+        if entry is None:
+            files.append({'type': 'nda', 'missing_reason': 'No signed NDA found'})
+        return None
+
+    logger.info(f'Saved NDA found by {how} for deal {deal_id}: {found["name"]}')
+    if entry is None:
+        entry = {'type': 'nda'}
+        files.append(entry)
+    entry['drive_file_id'] = found['id']
+    if how == 'name':
+        return f'NDA matched by name, check it: {found["name"]}'
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Legacy Zoho path (STORAGE_TARGET=zoho)
 # ---------------------------------------------------------------------------
@@ -331,7 +436,7 @@ def upload_to_zoho(deal_id, file_bytes, filename, content_type):
 # Core processing
 # ---------------------------------------------------------------------------
 
-def process_files(deal_id, files):
+def process_files(deal_id, files, note=None):
     results = []
     folder_id, folder_how = None, None
 
@@ -352,6 +457,10 @@ def process_files(deal_id, files):
         file_type = str(f.get('type', 'unknown')).strip()
         custom_fn = str(f.get('filename', '')).strip()
         saved_id  = str(f.get('drive_file_id', '')).strip()
+
+        if f.get('missing_reason') and not saved_id and not file_url.startswith('http'):
+            results.append({'ok': False, 'file_type': file_type, 'error': f['missing_reason']})
+            continue
 
         # A file already in Drive (an NDA saved at signing): copy it in, no download.
         if saved_id and STORAGE_TARGET == 'drive':
@@ -423,6 +532,8 @@ def process_files(deal_id, files):
             msg = f'Drive — {", ".join(uploaded) or "nothing"} filed'
             if failed:
                 msg += f' — MISSING: {", ".join(failed)}'
+            if note:
+                msg += f' — {note}'
             update_deal(deal_id, {'Latest_Action_Sync': f'{msg} — {ts}'})
         else:
             update_deal(deal_id, {'Latest_Action_Sync':
@@ -473,7 +584,9 @@ def upload_batch():
     if not deal_id:
         return jsonify({'ok': False, 'error': 'Missing or invalid deal_id'}), 400
 
-    return jsonify(process_files(deal_id, body.get('files', []))), 200
+    files = list(body.get('files', []) or [])
+    note = attach_saved_nda(deal_id, files)
+    return jsonify(process_files(deal_id, files, note)), 200
 
 
 @app.route('/save-nda', methods=['POST'])
